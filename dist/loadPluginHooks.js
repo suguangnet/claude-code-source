@@ -1,0 +1,250 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.loadPluginHooks = void 0;
+exports.clearPluginHookCache = clearPluginHookCache;
+exports.pruneRemovedPluginHooks = pruneRemovedPluginHooks;
+exports.resetHotReloadState = resetHotReloadState;
+exports.getPluginAffectingSettingsSnapshot = getPluginAffectingSettingsSnapshot;
+exports.setupPluginHookHotReload = setupPluginHookHotReload;
+const memoize_js_1 = __importDefault(require("lodash-es/memoize.js"));
+const state_js_1 = require("../../bootstrap/state.js");
+const debug_js_1 = require("../debug.js");
+const changeDetector_js_1 = require("../settings/changeDetector.js");
+const settings_js_1 = require("../settings/settings.js");
+const slowOperations_js_1 = require("../slowOperations.js");
+const pluginLoader_js_1 = require("./pluginLoader.js");
+// Track if hot reload subscription is set up
+let hotReloadSubscribed = false;
+// Snapshot of enabledPlugins for change detection in hot reload
+let lastPluginSettingsSnapshot;
+/**
+ * Convert plugin hooks configuration to native matchers with plugin context
+ */
+function convertPluginHooksToMatchers(plugin) {
+    const pluginMatchers = {
+        PreToolUse: [],
+        PostToolUse: [],
+        PostToolUseFailure: [],
+        PermissionDenied: [],
+        Notification: [],
+        UserPromptSubmit: [],
+        SessionStart: [],
+        SessionEnd: [],
+        Stop: [],
+        StopFailure: [],
+        SubagentStart: [],
+        SubagentStop: [],
+        PreCompact: [],
+        PostCompact: [],
+        PermissionRequest: [],
+        Setup: [],
+        TeammateIdle: [],
+        TaskCreated: [],
+        TaskCompleted: [],
+        Elicitation: [],
+        ElicitationResult: [],
+        ConfigChange: [],
+        WorktreeCreate: [],
+        WorktreeRemove: [],
+        InstructionsLoaded: [],
+        CwdChanged: [],
+        FileChanged: [],
+    };
+    if (!plugin.hooksConfig) {
+        return pluginMatchers;
+    }
+    // Process each hook event - pass through all hook types with plugin context
+    for (const [event, matchers] of Object.entries(plugin.hooksConfig)) {
+        const hookEvent = event;
+        if (!pluginMatchers[hookEvent]) {
+            continue;
+        }
+        for (const matcher of matchers) {
+            if (matcher.hooks.length > 0) {
+                pluginMatchers[hookEvent].push({
+                    matcher: matcher.matcher,
+                    hooks: matcher.hooks,
+                    pluginRoot: plugin.path,
+                    pluginName: plugin.name,
+                    pluginId: plugin.source,
+                });
+            }
+        }
+    }
+    return pluginMatchers;
+}
+/**
+ * Load and register hooks from all enabled plugins
+ */
+exports.loadPluginHooks = (0, memoize_js_1.default)(async () => {
+    const { enabled } = await (0, pluginLoader_js_1.loadAllPluginsCacheOnly)();
+    const allPluginHooks = {
+        PreToolUse: [],
+        PostToolUse: [],
+        PostToolUseFailure: [],
+        PermissionDenied: [],
+        Notification: [],
+        UserPromptSubmit: [],
+        SessionStart: [],
+        SessionEnd: [],
+        Stop: [],
+        StopFailure: [],
+        SubagentStart: [],
+        SubagentStop: [],
+        PreCompact: [],
+        PostCompact: [],
+        PermissionRequest: [],
+        Setup: [],
+        TeammateIdle: [],
+        TaskCreated: [],
+        TaskCompleted: [],
+        Elicitation: [],
+        ElicitationResult: [],
+        ConfigChange: [],
+        WorktreeCreate: [],
+        WorktreeRemove: [],
+        InstructionsLoaded: [],
+        CwdChanged: [],
+        FileChanged: [],
+    };
+    // Process each enabled plugin
+    for (const plugin of enabled) {
+        if (!plugin.hooksConfig) {
+            continue;
+        }
+        (0, debug_js_1.logForDebugging)(`Loading hooks from plugin: ${plugin.name}`);
+        const pluginMatchers = convertPluginHooksToMatchers(plugin);
+        // Merge plugin hooks into the main collection
+        for (const event of Object.keys(pluginMatchers)) {
+            allPluginHooks[event].push(...pluginMatchers[event]);
+        }
+    }
+    // Clear-then-register as an atomic pair. Previously the clear lived in
+    // clearPluginHookCache(), which meant any clearAllCaches() call (from
+    // /plugins UI, pluginInstallationHelpers, thinkback, etc.) wiped plugin
+    // hooks from STATE.registeredHooks and left them wiped until someone
+    // happened to call loadPluginHooks() again. SessionStart explicitly awaits
+    // loadPluginHooks() before firing so it always re-registered; Stop has no
+    // such guard, so plugin Stop hooks silently never fired after any plugin
+    // management operation (gh-29767). Doing the clear here makes the swap
+    // atomic — old hooks stay valid until this point, new hooks take over.
+    (0, state_js_1.clearRegisteredPluginHooks)();
+    (0, state_js_1.registerHookCallbacks)(allPluginHooks);
+    const totalHooks = Object.values(allPluginHooks).reduce((sum, matchers) => sum + matchers.reduce((s, m) => s + m.hooks.length, 0), 0);
+    (0, debug_js_1.logForDebugging)(`Registered ${totalHooks} hooks from ${enabled.length} plugins`);
+});
+function clearPluginHookCache() {
+    // Only invalidate the memoize — do NOT wipe STATE.registeredHooks here.
+    // Wiping here left plugin hooks dead between clearAllCaches() and the next
+    // loadPluginHooks() call, which for Stop hooks might never happen
+    // (gh-29767). The clear now lives inside loadPluginHooks() as an atomic
+    // clear-then-register, so old hooks stay valid until the fresh load swaps
+    // them out.
+    exports.loadPluginHooks.cache?.clear?.();
+}
+/**
+ * Remove hooks from plugins no longer in the enabled set, without adding
+ * hooks from newly-enabled plugins. Called from clearAllCaches() so
+ * uninstalled/disabled plugins stop firing hooks immediately (gh-36995),
+ * while newly-enabled plugins wait for /reload-plugins — consistent with
+ * how commands/agents/MCP behave.
+ *
+ * The full swap (clear + register all) still happens via loadPluginHooks(),
+ * which /reload-plugins awaits.
+ */
+async function pruneRemovedPluginHooks() {
+    // Early return when nothing to prune — avoids seeding the loadAllPluginsCacheOnly
+    // memoize in test/preload.ts beforeEach (which clears registeredHooks).
+    if (!(0, state_js_1.getRegisteredHooks)())
+        return;
+    const { enabled } = await (0, pluginLoader_js_1.loadAllPluginsCacheOnly)();
+    const enabledRoots = new Set(enabled.map(p => p.path));
+    // Re-read after the await: a concurrent loadPluginHooks() (hot-reload)
+    // could have swapped STATE.registeredHooks during the gap. Holding the
+    // pre-await reference would compute survivors from stale data.
+    const current = (0, state_js_1.getRegisteredHooks)();
+    if (!current)
+        return;
+    // Collect plugin hooks whose pluginRoot is still enabled, then swap via
+    // the existing clear+register pair (same atomic-pair pattern as
+    // loadPluginHooks above). Callback hooks are preserved by
+    // clearRegisteredPluginHooks; we only need to re-register survivors.
+    const survivors = {};
+    for (const [event, matchers] of Object.entries(current)) {
+        const kept = matchers.filter((m) => 'pluginRoot' in m && enabledRoots.has(m.pluginRoot));
+        if (kept.length > 0)
+            survivors[event] = kept;
+    }
+    (0, state_js_1.clearRegisteredPluginHooks)();
+    (0, state_js_1.registerHookCallbacks)(survivors);
+}
+/**
+ * Reset hot reload subscription state. Only for testing.
+ */
+function resetHotReloadState() {
+    hotReloadSubscribed = false;
+    lastPluginSettingsSnapshot = undefined;
+}
+/**
+ * Build a stable string snapshot of the settings that feed into
+ * `loadAllPluginsCacheOnly()` for change detection. Sorts keys so comparison is
+ * deterministic regardless of insertion order.
+ *
+ * Hashes FOUR fields — not just enabledPlugins — because the memoized
+ * loadAllPluginsCacheOnly() also reads strictKnownMarketplaces, blockedMarketplaces
+ * (pluginLoader.ts:1933 via getBlockedMarketplaces), and
+ * extraKnownMarketplaces. If remote managed settings set only one of
+ * these (no enabledPlugins), a snapshot keyed only on enabledPlugins
+ * would never diff, the listener would skip, and the memoized result
+ * would retain the pre-remote marketplace allow/blocklist.
+ * See #23085 / #23152 poisoned-cache discussion (Slack C09N89L3VNJ).
+ */
+// Exported for testing — the listener at setupPluginHookHotReload uses this
+// for change detection; tests verify it diffs on the fields that matter.
+function getPluginAffectingSettingsSnapshot() {
+    const merged = (0, settings_js_1.getSettings_DEPRECATED)();
+    const policy = (0, settings_js_1.getSettingsForSource)('policySettings');
+    // Key-sort the two Record fields so insertion order doesn't flap the hash.
+    // Array fields (strictKnownMarketplaces, blockedMarketplaces) have
+    // schema-stable order.
+    const sortKeys = (o) => o ? Object.fromEntries(Object.entries(o).sort()) : {};
+    return (0, slowOperations_js_1.jsonStringify)({
+        enabledPlugins: sortKeys(merged.enabledPlugins),
+        extraKnownMarketplaces: sortKeys(merged.extraKnownMarketplaces),
+        strictKnownMarketplaces: policy?.strictKnownMarketplaces ?? [],
+        blockedMarketplaces: policy?.blockedMarketplaces ?? [],
+    });
+}
+/**
+ * Set up hot reload for plugin hooks when remote settings change.
+ * When policySettings changes (e.g., from remote managed settings),
+ * compares the plugin-affecting settings snapshot and only reloads if it
+ * actually changed.
+ */
+function setupPluginHookHotReload() {
+    if (hotReloadSubscribed) {
+        return;
+    }
+    hotReloadSubscribed = true;
+    // Capture the initial snapshot so the first policySettings change can compare
+    lastPluginSettingsSnapshot = getPluginAffectingSettingsSnapshot();
+    changeDetector_js_1.settingsChangeDetector.subscribe(source => {
+        if (source === 'policySettings') {
+            const newSnapshot = getPluginAffectingSettingsSnapshot();
+            if (newSnapshot === lastPluginSettingsSnapshot) {
+                (0, debug_js_1.logForDebugging)('Plugin hooks: skipping reload, plugin-affecting settings unchanged');
+                return;
+            }
+            lastPluginSettingsSnapshot = newSnapshot;
+            (0, debug_js_1.logForDebugging)('Plugin hooks: reloading due to plugin-affecting settings change');
+            // Clear all plugin-related caches
+            (0, pluginLoader_js_1.clearPluginCache)('loadPluginHooks: plugin-affecting settings changed');
+            clearPluginHookCache();
+            // Reload hooks (fire-and-forget, don't block)
+            void (0, exports.loadPluginHooks)();
+        }
+    });
+}

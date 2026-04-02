@@ -1,0 +1,102 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MAX_WARNING_KEYS = void 0;
+exports.resetWarningHandler = resetWarningHandler;
+exports.initializeWarningHandler = initializeWarningHandler;
+const path_1 = require("path");
+const index_js_1 = require("src/services/analytics/index.js");
+const debug_js_1 = require("./debug.js");
+const envUtils_js_1 = require("./envUtils.js");
+const platform_js_1 = require("./platform.js");
+// Track warnings to avoid spam — bounded to prevent unbounded memory growth
+exports.MAX_WARNING_KEYS = 1000;
+const warningCounts = new Map();
+// Check if running from a build directory (development mode)
+// This is a sync version of the logic in getCurrentInstallationType()
+function isRunningFromBuildDirectory() {
+    let invokedPath = process.argv[1] || '';
+    let execPath = process.execPath || process.argv[0] || '';
+    // On Windows, convert backslashes to forward slashes for consistent path matching
+    if ((0, platform_js_1.getPlatform)() === 'windows') {
+        invokedPath = invokedPath.split(path_1.win32.sep).join(path_1.posix.sep);
+        execPath = execPath.split(path_1.win32.sep).join(path_1.posix.sep);
+    }
+    const pathsToCheck = [invokedPath, execPath];
+    const buildDirs = [
+        '/build-ant/',
+        '/build-external/',
+        '/build-external-native/',
+        '/build-ant-native/',
+    ];
+    return pathsToCheck.some(path => buildDirs.some(dir => path.includes(dir)));
+}
+// Warnings we know about and want to suppress from users
+const INTERNAL_WARNINGS = [
+    /MaxListenersExceededWarning.*AbortSignal/,
+    /MaxListenersExceededWarning.*EventTarget/,
+];
+function isInternalWarning(warning) {
+    const warningStr = `${warning.name}: ${warning.message}`;
+    return INTERNAL_WARNINGS.some(pattern => pattern.test(warningStr));
+}
+// Store reference to our warning handler so we can detect if it's already installed
+let warningHandler = null;
+// For testing only - allows resetting the warning handler state
+function resetWarningHandler() {
+    if (warningHandler) {
+        process.removeListener('warning', warningHandler);
+    }
+    warningHandler = null;
+    warningCounts.clear();
+}
+function initializeWarningHandler() {
+    // Only set up handler once - check if our handler is already installed
+    const currentListeners = process.listeners('warning');
+    if (warningHandler && currentListeners.includes(warningHandler)) {
+        return;
+    }
+    // For external users, remove default Node.js handler to suppress stderr output
+    // For internal users, only keep default warnings for development builds
+    // Check development mode directly to avoid async call in init
+    // This preserves the same logic as getCurrentInstallationType() without async
+    const isDevelopment = process.env.NODE_ENV === 'development' || isRunningFromBuildDirectory();
+    if (!isDevelopment) {
+        process.removeAllListeners('warning');
+    }
+    // Create and store our warning handler
+    warningHandler = (warning) => {
+        try {
+            const warningKey = `${warning.name}: ${warning.message.slice(0, 50)}`;
+            const count = warningCounts.get(warningKey) || 0;
+            // Bound the map to prevent unbounded memory growth from unique warning keys.
+            // Once the cap is reached, new unique keys are not tracked — their
+            // occurrence_count will always be reported as 1 in analytics.
+            if (warningCounts.has(warningKey) ||
+                warningCounts.size < exports.MAX_WARNING_KEYS) {
+                warningCounts.set(warningKey, count + 1);
+            }
+            const isInternal = isInternalWarning(warning);
+            // Always log to Statsig for monitoring
+            // Include full details for ant users only, since they may contain code or filepaths
+            (0, index_js_1.logEvent)('tengu_node_warning', {
+                is_internal: isInternal ? 1 : 0,
+                occurrence_count: count + 1,
+                classname: warning.name,
+                ...(process.env.USER_TYPE === 'ant' && {
+                    message: warning.message,
+                }),
+            });
+            // In debug mode, show all warnings with context
+            if ((0, envUtils_js_1.isEnvTruthy)(process.env.CLAUDE_DEBUG)) {
+                const prefix = isInternal ? '[Internal Warning]' : '[Warning]';
+                (0, debug_js_1.logForDebugging)(`${prefix} ${warning.toString()}`, { level: 'warn' });
+            }
+            // Hide all warnings from users - they are only logged to Statsig for monitoring
+        }
+        catch {
+            // Fail silently - we don't want the warning handler to cause issues
+        }
+    };
+    // Install the warning handler
+    process.on('warning', warningHandler);
+}

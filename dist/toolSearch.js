@@ -1,0 +1,566 @@
+"use strict";
+/**
+ * Tool Search utilities for dynamically discovering deferred tools.
+ *
+ * When enabled, deferred tools (MCP and shouldDefer tools) are sent with
+ * defer_loading: true and discovered via ToolSearchTool rather than being
+ * loaded upfront.
+ */
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getAutoToolSearchCharThreshold = getAutoToolSearchCharThreshold;
+exports.getToolSearchMode = getToolSearchMode;
+exports.modelSupportsToolReference = modelSupportsToolReference;
+exports.isToolSearchEnabledOptimistic = isToolSearchEnabledOptimistic;
+exports.isToolSearchToolAvailable = isToolSearchToolAvailable;
+exports.isToolSearchEnabled = isToolSearchEnabled;
+exports.isToolReferenceBlock = isToolReferenceBlock;
+exports.extractDiscoveredToolNames = extractDiscoveredToolNames;
+exports.isDeferredToolsDeltaEnabled = isDeferredToolsDeltaEnabled;
+exports.getDeferredToolsDelta = getDeferredToolsDelta;
+const memoize_js_1 = __importDefault(require("lodash-es/memoize.js"));
+const growthbook_js_1 = require("../services/analytics/growthbook.js");
+const index_js_1 = require("../services/analytics/index.js");
+const Tool_js_1 = require("../Tool.js");
+const prompt_js_1 = require("../tools/ToolSearchTool/prompt.js");
+const analyzeContext_js_1 = require("./analyzeContext.js");
+const array_js_1 = require("./array.js");
+const betas_js_1 = require("./betas.js");
+const context_js_1 = require("./context.js");
+const debug_js_1 = require("./debug.js");
+const envUtils_js_1 = require("./envUtils.js");
+const providers_js_1 = require("./model/providers.js");
+const slowOperations_js_1 = require("./slowOperations.js");
+const zodToJsonSchema_js_1 = require("./zodToJsonSchema.js");
+/**
+ * Default percentage of context window at which to auto-enable tool search.
+ * When MCP tool descriptions exceed this percentage (in tokens), tool search is enabled.
+ * Can be overridden via ENABLE_TOOL_SEARCH=auto:N where N is 0-100.
+ */
+const DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE = 10; // 10%
+/**
+ * Parse auto:N syntax from ENABLE_TOOL_SEARCH env var.
+ * Returns the percentage clamped to 0-100, or null if not auto:N format or not a number.
+ */
+function parseAutoPercentage(value) {
+    if (!value.startsWith('auto:'))
+        return null;
+    const percentStr = value.slice(5);
+    const percent = parseInt(percentStr, 10);
+    if (isNaN(percent)) {
+        (0, debug_js_1.logForDebugging)(`Invalid ENABLE_TOOL_SEARCH value "${value}": expected auto:N where N is a number.`);
+        return null;
+    }
+    // Clamp to valid range
+    return Math.max(0, Math.min(100, percent));
+}
+/**
+ * Check if ENABLE_TOOL_SEARCH is set to auto mode (auto or auto:N).
+ */
+function isAutoToolSearchMode(value) {
+    if (!value)
+        return false;
+    return value === 'auto' || value.startsWith('auto:');
+}
+/**
+ * Get the auto-enable percentage from env var or default.
+ */
+function getAutoToolSearchPercentage() {
+    const value = process.env.ENABLE_TOOL_SEARCH;
+    if (!value)
+        return DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE;
+    if (value === 'auto')
+        return DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE;
+    const parsed = parseAutoPercentage(value);
+    if (parsed !== null)
+        return parsed;
+    return DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE;
+}
+/**
+ * Approximate chars per token for MCP tool definitions (name + description + input schema).
+ * Used as fallback when the token counting API is unavailable.
+ */
+const CHARS_PER_TOKEN = 2.5;
+/**
+ * Get the token threshold for auto-enabling tool search for a given model.
+ */
+function getAutoToolSearchTokenThreshold(model) {
+    const betas = (0, betas_js_1.getMergedBetas)(model);
+    const contextWindow = (0, context_js_1.getContextWindowForModel)(model, betas);
+    const percentage = getAutoToolSearchPercentage() / 100;
+    return Math.floor(contextWindow * percentage);
+}
+/**
+ * Get the character threshold for auto-enabling tool search for a given model.
+ * Used as fallback when the token counting API is unavailable.
+ */
+function getAutoToolSearchCharThreshold(model) {
+    return Math.floor(getAutoToolSearchTokenThreshold(model) * CHARS_PER_TOKEN);
+}
+/**
+ * Get the total token count for all deferred tools using the token counting API.
+ * Memoized by deferred tool names — cache is invalidated when MCP servers connect/disconnect.
+ * Returns null if the API is unavailable (caller should fall back to char heuristic).
+ */
+const getDeferredToolTokenCount = (0, memoize_js_1.default)(async (tools, getToolPermissionContext, agents, model) => {
+    const deferredTools = tools.filter(t => (0, prompt_js_1.isDeferredTool)(t));
+    if (deferredTools.length === 0)
+        return 0;
+    try {
+        const total = await (0, analyzeContext_js_1.countToolDefinitionTokens)(deferredTools, getToolPermissionContext, { activeAgents: agents, allAgents: agents }, model);
+        if (total === 0)
+            return null; // API unavailable
+        return Math.max(0, total - analyzeContext_js_1.TOOL_TOKEN_COUNT_OVERHEAD);
+    }
+    catch {
+        return null; // Fall back to char heuristic
+    }
+}, (tools) => tools
+    .filter(t => (0, prompt_js_1.isDeferredTool)(t))
+    .map(t => t.name)
+    .join(','));
+/**
+ * Determines the tool search mode from ENABLE_TOOL_SEARCH.
+ *
+ *   ENABLE_TOOL_SEARCH    Mode
+ *   auto / auto:1-99      tst-auto
+ *   true / auto:0         tst
+ *   false / auto:100      standard
+ *   (unset)               tst (default: always defer MCP and shouldDefer tools)
+ */
+function getToolSearchMode() {
+    // CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is a kill switch for beta API
+    // features. Tool search emits defer_loading on tool definitions and
+    // tool_reference content blocks — both require the API to accept a beta
+    // header. When the kill switch is set, force 'standard' so no beta shapes
+    // reach the wire, even if ENABLE_TOOL_SEARCH is also set. This is the
+    // explicit escape hatch for proxy gateways that the heuristic in
+    // isToolSearchEnabledOptimistic doesn't cover.
+    // github.com/anthropics/claude-code/issues/20031
+    if ((0, envUtils_js_1.isEnvTruthy)(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)) {
+        return 'standard';
+    }
+    const value = process.env.ENABLE_TOOL_SEARCH;
+    // Handle auto:N syntax - check edge cases first
+    const autoPercent = value ? parseAutoPercentage(value) : null;
+    if (autoPercent === 0)
+        return 'tst'; // auto:0 = always enabled
+    if (autoPercent === 100)
+        return 'standard';
+    if (isAutoToolSearchMode(value)) {
+        return 'tst-auto'; // auto or auto:1-99
+    }
+    if ((0, envUtils_js_1.isEnvTruthy)(value))
+        return 'tst';
+    if ((0, envUtils_js_1.isEnvDefinedFalsy)(process.env.ENABLE_TOOL_SEARCH))
+        return 'standard';
+    return 'tst'; // default: always defer MCP and shouldDefer tools
+}
+/**
+ * Default patterns for models that do NOT support tool_reference.
+ * New models are assumed to support tool_reference unless explicitly listed here.
+ */
+const DEFAULT_UNSUPPORTED_MODEL_PATTERNS = ['haiku'];
+/**
+ * Get the list of model patterns that do NOT support tool_reference.
+ * Can be configured via GrowthBook for live updates without code changes.
+ */
+function getUnsupportedToolReferencePatterns() {
+    try {
+        // Try to get from GrowthBook for live configuration
+        const patterns = (0, growthbook_js_1.getFeatureValue_CACHED_MAY_BE_STALE)('tengu_tool_search_unsupported_models', null);
+        if (patterns && Array.isArray(patterns) && patterns.length > 0) {
+            return patterns;
+        }
+    }
+    catch {
+        // GrowthBook not ready, use defaults
+    }
+    return DEFAULT_UNSUPPORTED_MODEL_PATTERNS;
+}
+/**
+ * Check if a model supports tool_reference blocks (required for tool search).
+ *
+ * This uses a negative test: models are assumed to support tool_reference
+ * UNLESS they match a pattern in the unsupported list. This ensures new
+ * models work by default without code changes.
+ *
+ * Currently, Haiku models do NOT support tool_reference. This can be
+ * updated via GrowthBook feature 'tengu_tool_search_unsupported_models'.
+ *
+ * @param model The model name to check
+ * @returns true if the model supports tool_reference, false otherwise
+ */
+function modelSupportsToolReference(model) {
+    const normalizedModel = model.toLowerCase();
+    const unsupportedPatterns = getUnsupportedToolReferencePatterns();
+    // Check if model matches any unsupported pattern
+    for (const pattern of unsupportedPatterns) {
+        if (normalizedModel.includes(pattern.toLowerCase())) {
+            return false;
+        }
+    }
+    // New models are assumed to support tool_reference
+    return true;
+}
+/**
+ * Check if tool search *might* be enabled (optimistic check).
+ *
+ * Returns true if tool search could potentially be enabled, without checking
+ * dynamic factors like model support or threshold. Use this for:
+ * - Including ToolSearchTool in base tools (so it's available if needed)
+ * - Preserving tool_reference fields in messages (can be stripped later)
+ * - Checking if ToolSearchTool should report itself as enabled
+ *
+ * Returns false only when tool search is definitively disabled (standard mode).
+ *
+ * For the definitive check that includes model support and threshold,
+ * use isToolSearchEnabled().
+ */
+let loggedOptimistic = false;
+function isToolSearchEnabledOptimistic() {
+    const mode = getToolSearchMode();
+    if (mode === 'standard') {
+        if (!loggedOptimistic) {
+            loggedOptimistic = true;
+            (0, debug_js_1.logForDebugging)(`[ToolSearch:optimistic] mode=${mode}, ENABLE_TOOL_SEARCH=${process.env.ENABLE_TOOL_SEARCH}, result=false`);
+        }
+        return false;
+    }
+    // tool_reference is a beta content type that third-party API gateways
+    // (ANTHROPIC_BASE_URL proxies) typically don't support. When the provider
+    // is 'firstParty' but the base URL points elsewhere, the proxy will reject
+    // tool_reference blocks with a 400. Vertex/Bedrock/Foundry are unaffected —
+    // they have their own endpoints and beta headers.
+    // https://github.com/anthropics/claude-code/issues/30912
+    //
+    // HOWEVER: some proxies DO support tool_reference (LiteLLM passthrough,
+    // Cloudflare AI Gateway, corp gateways that forward beta headers). The
+    // blanket disable breaks defer_loading for those users — all MCP tools
+    // loaded into main context instead of on-demand (gh-31936 / CC-457,
+    // likely the real cause of CC-330 "v2.1.70 defer_loading regression").
+    // This gate only applies when ENABLE_TOOL_SEARCH is unset/empty (default
+    // behavior). Setting any non-empty value — 'true', 'auto', 'auto:N' —
+    // means the user is explicitly configuring tool search and asserts their
+    // setup supports it. The falsy check (rather than === undefined) aligns
+    // with getToolSearchMode(), which also treats "" as unset.
+    if (!process.env.ENABLE_TOOL_SEARCH &&
+        (0, providers_js_1.getAPIProvider)() === 'firstParty' &&
+        !(0, providers_js_1.isFirstPartyAnthropicBaseUrl)()) {
+        if (!loggedOptimistic) {
+            loggedOptimistic = true;
+            (0, debug_js_1.logForDebugging)(`[ToolSearch:optimistic] disabled: ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL} is not a first-party Anthropic host. Set ENABLE_TOOL_SEARCH=true (or auto / auto:N) if your proxy forwards tool_reference blocks.`);
+        }
+        return false;
+    }
+    if (!loggedOptimistic) {
+        loggedOptimistic = true;
+        (0, debug_js_1.logForDebugging)(`[ToolSearch:optimistic] mode=${mode}, ENABLE_TOOL_SEARCH=${process.env.ENABLE_TOOL_SEARCH}, result=true`);
+    }
+    return true;
+}
+/**
+ * Check if ToolSearchTool is available in the provided tools list.
+ * If ToolSearchTool is not available (e.g., disallowed via disallowedTools),
+ * tool search cannot function and should be disabled.
+ *
+ * @param tools Array of tools with a 'name' property
+ * @returns true if ToolSearchTool is in the tools list, false otherwise
+ */
+function isToolSearchToolAvailable(tools) {
+    return tools.some(tool => (0, Tool_js_1.toolMatchesName)(tool, prompt_js_1.TOOL_SEARCH_TOOL_NAME));
+}
+/**
+ * Calculate total deferred tool description size in characters.
+ * Includes name, description text, and input schema to match what's actually sent to the API.
+ */
+async function calculateDeferredToolDescriptionChars(tools, getToolPermissionContext, agents) {
+    const deferredTools = tools.filter(t => (0, prompt_js_1.isDeferredTool)(t));
+    if (deferredTools.length === 0)
+        return 0;
+    const sizes = await Promise.all(deferredTools.map(async (tool) => {
+        const description = await tool.prompt({
+            getToolPermissionContext,
+            tools,
+            agents,
+        });
+        const inputSchema = tool.inputJSONSchema
+            ? (0, slowOperations_js_1.jsonStringify)(tool.inputJSONSchema)
+            : tool.inputSchema
+                ? (0, slowOperations_js_1.jsonStringify)((0, zodToJsonSchema_js_1.zodToJsonSchema)(tool.inputSchema))
+                : '';
+        return tool.name.length + description.length + inputSchema.length;
+    }));
+    return sizes.reduce((total, size) => total + size, 0);
+}
+/**
+ * Check if tool search (MCP tool deferral with tool_reference) is enabled for a specific request.
+ *
+ * This is the definitive check that includes:
+ * - MCP mode (Tst, TstAuto, McpCli, Standard)
+ * - Model compatibility (haiku doesn't support tool_reference)
+ * - ToolSearchTool availability (must be in tools list)
+ * - Threshold check for TstAuto mode
+ *
+ * Use this when making actual API calls where all context is available.
+ *
+ * @param model The model to check for tool_reference support
+ * @param tools Array of available tools (including MCP tools)
+ * @param getToolPermissionContext Function to get tool permission context
+ * @param agents Array of agent definitions
+ * @param source Optional identifier for the caller (for debugging)
+ * @returns true if tool search should be enabled for this request
+ */
+async function isToolSearchEnabled(model, tools, getToolPermissionContext, agents, source) {
+    const mcpToolCount = (0, array_js_1.count)(tools, t => t.isMcp);
+    // Helper to log the mode decision event
+    function logModeDecision(enabled, mode, reason, extraProps) {
+        (0, index_js_1.logEvent)('tengu_tool_search_mode_decision', {
+            enabled,
+            mode: mode,
+            reason: reason,
+            // Log the actual model being checked, not the session's main model.
+            // This is important for debugging subagent tool search decisions where
+            // the subagent model (e.g., haiku) differs from the session model (e.g., opus).
+            checkedModel: model,
+            mcpToolCount,
+            userType: (process.env.USER_TYPE ??
+                'external'),
+            ...extraProps,
+        });
+    }
+    // Check if model supports tool_reference
+    if (!modelSupportsToolReference(model)) {
+        (0, debug_js_1.logForDebugging)(`Tool search disabled for model '${model}': model does not support tool_reference blocks. ` +
+            `This feature is only available on Claude Sonnet 4+, Opus 4+, and newer models.`);
+        logModeDecision(false, 'standard', 'model_unsupported');
+        return false;
+    }
+    // Check if ToolSearchTool is available (respects disallowedTools)
+    if (!isToolSearchToolAvailable(tools)) {
+        (0, debug_js_1.logForDebugging)(`Tool search disabled: ToolSearchTool is not available (may have been disallowed via disallowedTools).`);
+        logModeDecision(false, 'standard', 'mcp_search_unavailable');
+        return false;
+    }
+    const mode = getToolSearchMode();
+    switch (mode) {
+        case 'tst':
+            logModeDecision(true, mode, 'tst_enabled');
+            return true;
+        case 'tst-auto': {
+            const { enabled, debugDescription, metrics } = await checkAutoThreshold(tools, getToolPermissionContext, agents, model);
+            if (enabled) {
+                (0, debug_js_1.logForDebugging)(`Auto tool search enabled: ${debugDescription}` +
+                    (source ? ` [source: ${source}]` : ''));
+                logModeDecision(true, mode, 'auto_above_threshold', metrics);
+                return true;
+            }
+            (0, debug_js_1.logForDebugging)(`Auto tool search disabled: ${debugDescription}` +
+                (source ? ` [source: ${source}]` : ''));
+            logModeDecision(false, mode, 'auto_below_threshold', metrics);
+            return false;
+        }
+        case 'standard':
+            logModeDecision(false, mode, 'standard_mode');
+            return false;
+    }
+}
+/**
+ * Check if an object is a tool_reference block.
+ * tool_reference is a beta feature not in the SDK types, so we need runtime checks.
+ */
+function isToolReferenceBlock(obj) {
+    return (typeof obj === 'object' &&
+        obj !== null &&
+        'type' in obj &&
+        obj.type === 'tool_reference');
+}
+/**
+ * Type guard for tool_reference block with tool_name.
+ */
+function isToolReferenceWithName(obj) {
+    return (isToolReferenceBlock(obj) &&
+        'tool_name' in obj &&
+        typeof obj.tool_name === 'string');
+}
+/**
+ * Type guard for tool_result blocks with array content.
+ */
+function isToolResultBlockWithContent(obj) {
+    return (typeof obj === 'object' &&
+        obj !== null &&
+        'type' in obj &&
+        obj.type === 'tool_result' &&
+        'content' in obj &&
+        Array.isArray(obj.content));
+}
+/**
+ * Extract tool names from tool_reference blocks in message history.
+ *
+ * When dynamic tool loading is enabled, MCP tools are not predeclared in the
+ * tools array. Instead, they are discovered via ToolSearchTool which returns
+ * tool_reference blocks. This function scans the message history to find all
+ * tool names that have been referenced, so we can include only those tools
+ * in subsequent API requests.
+ *
+ * This approach:
+ * - Eliminates the need to predeclare all MCP tools upfront
+ * - Removes limits on total quantity of MCP tools
+ *
+ * Compaction replaces tool_reference-bearing messages with a summary, so it
+ * snapshots the discovered set onto compactMetadata.preCompactDiscoveredTools
+ * on the boundary marker; this scan reads it back. Snip instead protects the
+ * tool_reference-carrying messages from removal.
+ *
+ * @param messages Array of messages that may contain tool_result blocks with tool_reference content
+ * @returns Set of tool names that have been discovered via tool_reference blocks
+ */
+function extractDiscoveredToolNames(messages) {
+    const discoveredTools = new Set();
+    let carriedFromBoundary = 0;
+    for (const msg of messages) {
+        // Compact boundary carries the pre-compact discovered set. Inline type
+        // check rather than isCompactBoundaryMessage — utils/messages.ts imports
+        // from this file, so importing back would be circular.
+        if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
+            const carried = msg.compactMetadata?.preCompactDiscoveredTools;
+            if (carried) {
+                for (const name of carried)
+                    discoveredTools.add(name);
+                carriedFromBoundary += carried.length;
+            }
+            continue;
+        }
+        // Only user messages contain tool_result blocks (responses to tool_use)
+        if (msg.type !== 'user')
+            continue;
+        const content = msg.message?.content;
+        if (!Array.isArray(content))
+            continue;
+        for (const block of content) {
+            // tool_reference blocks only appear inside tool_result content, specifically
+            // in results from ToolSearchTool. The API expands these references into full
+            // tool definitions in the model's context.
+            if (isToolResultBlockWithContent(block)) {
+                for (const item of block.content) {
+                    if (isToolReferenceWithName(item)) {
+                        discoveredTools.add(item.tool_name);
+                    }
+                }
+            }
+        }
+    }
+    if (discoveredTools.size > 0) {
+        (0, debug_js_1.logForDebugging)(`Dynamic tool loading: found ${discoveredTools.size} discovered tools in message history` +
+            (carriedFromBoundary > 0
+                ? ` (${carriedFromBoundary} carried from compact boundary)`
+                : ''));
+    }
+    return discoveredTools;
+}
+/**
+ * True → announce deferred tools via persisted delta attachments.
+ * False → claude.ts keeps its per-call <available-deferred-tools>
+ * header prepend (the attachment does not fire).
+ */
+function isDeferredToolsDeltaEnabled() {
+    return (process.env.USER_TYPE === 'ant' ||
+        (0, growthbook_js_1.getFeatureValue_CACHED_MAY_BE_STALE)('tengu_glacier_2xr', false));
+}
+/**
+ * Diff the current deferred-tool pool against what's already been
+ * announced in this conversation (reconstructed by scanning for prior
+ * deferred_tools_delta attachments). Returns null if nothing changed.
+ *
+ * A name that was announced but has since stopped being deferred — yet
+ * is still in the base pool — is NOT reported as removed. It's now
+ * loaded directly, so telling the model "no longer available" would be
+ * wrong.
+ */
+function getDeferredToolsDelta(tools, messages, scanContext) {
+    const announced = new Set();
+    let attachmentCount = 0;
+    let dtdCount = 0;
+    const attachmentTypesSeen = new Set();
+    for (const msg of messages) {
+        if (msg.type !== 'attachment')
+            continue;
+        attachmentCount++;
+        attachmentTypesSeen.add(msg.attachment.type);
+        if (msg.attachment.type !== 'deferred_tools_delta')
+            continue;
+        dtdCount++;
+        for (const n of msg.attachment.addedNames)
+            announced.add(n);
+        for (const n of msg.attachment.removedNames)
+            announced.delete(n);
+    }
+    const deferred = tools.filter(prompt_js_1.isDeferredTool);
+    const deferredNames = new Set(deferred.map(t => t.name));
+    const poolNames = new Set(tools.map(t => t.name));
+    const added = deferred.filter(t => !announced.has(t.name));
+    const removed = [];
+    for (const n of announced) {
+        if (deferredNames.has(n))
+            continue;
+        if (!poolNames.has(n))
+            removed.push(n);
+        // else: undeferred — silent
+    }
+    if (added.length === 0 && removed.length === 0)
+        return null;
+    // Diagnostic for the inc-4747 scan-finds-nothing bug. Round-1 fields
+    // (messagesLength/attachmentCount/dtdCount from #23167) showed 45.6% of
+    // events have attachments-but-no-DTD, but those numbers are confounded:
+    // subagent first-fires and compact-path scans have EXPECTED prior=0 and
+    // dominate the stat. callSite/querySource/attachmentTypesSeen split the
+    // buckets so the real main-thread cross-turn failure is isolable in BQ.
+    (0, index_js_1.logEvent)('tengu_deferred_tools_pool_change', {
+        addedCount: added.length,
+        removedCount: removed.length,
+        priorAnnouncedCount: announced.size,
+        messagesLength: messages.length,
+        attachmentCount,
+        dtdCount,
+        callSite: (scanContext?.callSite ??
+            'unknown'),
+        querySource: (scanContext?.querySource ??
+            'unknown'),
+        attachmentTypesSeen: [...attachmentTypesSeen]
+            .sort()
+            .join(','),
+    });
+    return {
+        addedNames: added.map(t => t.name).sort(),
+        addedLines: added.map(prompt_js_1.formatDeferredToolLine).sort(),
+        removedNames: removed.sort(),
+    };
+}
+/**
+ * Check whether deferred tools exceed the auto-threshold for enabling TST.
+ * Tries exact token count first; falls back to character-based heuristic.
+ */
+async function checkAutoThreshold(tools, getToolPermissionContext, agents, model) {
+    // Try exact token count first (cached, one API call per toolset change)
+    const deferredToolTokens = await getDeferredToolTokenCount(tools, getToolPermissionContext, agents, model);
+    if (deferredToolTokens !== null) {
+        const threshold = getAutoToolSearchTokenThreshold(model);
+        return {
+            enabled: deferredToolTokens >= threshold,
+            debugDescription: `${deferredToolTokens} tokens (threshold: ${threshold}, ` +
+                `${getAutoToolSearchPercentage()}% of context)`,
+            metrics: { deferredToolTokens, threshold },
+        };
+    }
+    // Fallback: character-based heuristic when token API is unavailable
+    const deferredToolDescriptionChars = await calculateDeferredToolDescriptionChars(tools, getToolPermissionContext, agents);
+    const charThreshold = getAutoToolSearchCharThreshold(model);
+    return {
+        enabled: deferredToolDescriptionChars >= charThreshold,
+        debugDescription: `${deferredToolDescriptionChars} chars (threshold: ${charThreshold}, ` +
+            `${getAutoToolSearchPercentage()}% of context) (char fallback)`,
+        metrics: { deferredToolDescriptionChars, charThreshold },
+    };
+}

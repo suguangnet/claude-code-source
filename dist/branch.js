@@ -1,0 +1,209 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.deriveFirstPrompt = deriveFirstPrompt;
+exports.call = call;
+const crypto_1 = require("crypto");
+const promises_1 = require("fs/promises");
+const state_js_1 = require("../../bootstrap/state.js");
+const index_js_1 = require("../../services/analytics/index.js");
+const json_js_1 = require("../../utils/json.js");
+const sessionStorage_js_1 = require("../../utils/sessionStorage.js");
+const slowOperations_js_1 = require("../../utils/slowOperations.js");
+const stringUtils_js_1 = require("../../utils/stringUtils.js");
+/**
+ * Derive a single-line title base from the first user message.
+ * Collapses whitespace — multiline first messages (pasted stacks, code)
+ * otherwise flow into the saved title and break the resume hint.
+ */
+function deriveFirstPrompt(firstUserMessage) {
+    const content = firstUserMessage?.message?.content;
+    if (!content)
+        return 'Branched conversation';
+    const raw = typeof content === 'string'
+        ? content
+        : content.find((block) => block.type === 'text')?.text;
+    if (!raw)
+        return 'Branched conversation';
+    return (raw.replace(/\s+/g, ' ').trim().slice(0, 100) || 'Branched conversation');
+}
+/**
+ * Creates a fork of the current conversation by copying from the transcript file.
+ * Preserves all original metadata (timestamps, gitBranch, etc.) while updating
+ * sessionId and adding forkedFrom traceability.
+ */
+async function createFork(customTitle) {
+    const forkSessionId = (0, crypto_1.randomUUID)();
+    const originalSessionId = (0, state_js_1.getSessionId)();
+    const projectDir = (0, sessionStorage_js_1.getProjectDir)((0, state_js_1.getOriginalCwd)());
+    const forkSessionPath = (0, sessionStorage_js_1.getTranscriptPathForSession)(forkSessionId);
+    const currentTranscriptPath = (0, sessionStorage_js_1.getTranscriptPath)();
+    // Ensure project directory exists
+    await (0, promises_1.mkdir)(projectDir, { recursive: true, mode: 0o700 });
+    // Read current transcript file
+    let transcriptContent;
+    try {
+        transcriptContent = await (0, promises_1.readFile)(currentTranscriptPath);
+    }
+    catch {
+        throw new Error('No conversation to branch');
+    }
+    if (transcriptContent.length === 0) {
+        throw new Error('No conversation to branch');
+    }
+    // Parse all transcript entries (messages + metadata entries like content-replacement)
+    const entries = (0, json_js_1.parseJSONL)(transcriptContent);
+    // Filter to only main conversation messages (exclude sidechains and non-message entries)
+    const mainConversationEntries = entries.filter((entry) => (0, sessionStorage_js_1.isTranscriptMessage)(entry) && !entry.isSidechain);
+    // Content-replacement entries for the original session. These record which
+    // tool_result blocks were replaced with previews by the per-message budget.
+    // Without them in the fork JSONL, `claude -r {forkId}` reconstructs state
+    // with an empty replacements Map → previously-replaced results are classified
+    // as FROZEN and sent as full content (prompt cache miss + permanent overage).
+    // sessionId must be rewritten since loadTranscriptFile keys lookup by the
+    // session's messages' sessionId.
+    const contentReplacementRecords = entries
+        .filter((entry) => entry.type === 'content-replacement' &&
+        entry.sessionId === originalSessionId)
+        .flatMap(entry => entry.replacements);
+    if (mainConversationEntries.length === 0) {
+        throw new Error('No messages to branch');
+    }
+    // Build forked entries with new sessionId and preserved metadata
+    let parentUuid = null;
+    const lines = [];
+    const serializedMessages = [];
+    for (const entry of mainConversationEntries) {
+        // Create forked transcript entry preserving all original metadata
+        const forkedEntry = {
+            ...entry,
+            sessionId: forkSessionId,
+            parentUuid,
+            isSidechain: false,
+            forkedFrom: {
+                sessionId: originalSessionId,
+                messageUuid: entry.uuid,
+            },
+        };
+        // Build serialized message for LogOption
+        const serialized = {
+            ...entry,
+            sessionId: forkSessionId,
+        };
+        serializedMessages.push(serialized);
+        lines.push((0, slowOperations_js_1.jsonStringify)(forkedEntry));
+        if (entry.type !== 'progress') {
+            parentUuid = entry.uuid;
+        }
+    }
+    // Append content-replacement entry (if any) with the fork's sessionId.
+    // Written as a SINGLE entry (same shape as insertContentReplacement) so
+    // loadTranscriptFile's content-replacement branch picks it up.
+    if (contentReplacementRecords.length > 0) {
+        const forkedReplacementEntry = {
+            type: 'content-replacement',
+            sessionId: forkSessionId,
+            replacements: contentReplacementRecords,
+        };
+        lines.push((0, slowOperations_js_1.jsonStringify)(forkedReplacementEntry));
+    }
+    // Write the fork session file
+    await (0, promises_1.writeFile)(forkSessionPath, lines.join('\n') + '\n', {
+        encoding: 'utf8',
+        mode: 0o600,
+    });
+    return {
+        sessionId: forkSessionId,
+        title: customTitle,
+        forkPath: forkSessionPath,
+        serializedMessages,
+        contentReplacementRecords,
+    };
+}
+/**
+ * Generates a unique fork name by checking for collisions with existing session names.
+ * If "baseName (Branch)" already exists, tries "baseName (Branch 2)", "baseName (Branch 3)", etc.
+ */
+async function getUniqueForkName(baseName) {
+    const candidateName = `${baseName} (Branch)`;
+    // Check if this exact name already exists
+    const existingWithExactName = await (0, sessionStorage_js_1.searchSessionsByCustomTitle)(candidateName, { exact: true });
+    if (existingWithExactName.length === 0) {
+        return candidateName;
+    }
+    // Name collision - find a unique numbered suffix
+    // Search for all sessions that start with the base pattern
+    const existingForks = await (0, sessionStorage_js_1.searchSessionsByCustomTitle)(`${baseName} (Branch`);
+    // Extract existing fork numbers to find the next available
+    const usedNumbers = new Set([1]); // Consider " (Branch)" as number 1
+    const forkNumberPattern = new RegExp(`^${(0, stringUtils_js_1.escapeRegExp)(baseName)} \\(Branch(?: (\\d+))?\\)$`);
+    for (const session of existingForks) {
+        const match = session.customTitle?.match(forkNumberPattern);
+        if (match) {
+            if (match[1]) {
+                usedNumbers.add(parseInt(match[1], 10));
+            }
+            else {
+                usedNumbers.add(1); // " (Branch)" without number is treated as 1
+            }
+        }
+    }
+    // Find the next available number
+    let nextNumber = 2;
+    while (usedNumbers.has(nextNumber)) {
+        nextNumber++;
+    }
+    return `${baseName} (Branch ${nextNumber})`;
+}
+async function call(onDone, context, args) {
+    const customTitle = args?.trim() || undefined;
+    const originalSessionId = (0, state_js_1.getSessionId)();
+    try {
+        const { sessionId, title, forkPath, serializedMessages, contentReplacementRecords, } = await createFork(customTitle);
+        // Build LogOption for resume
+        const now = new Date();
+        const firstPrompt = deriveFirstPrompt(serializedMessages.find(m => m.type === 'user'));
+        // Save custom title - use provided title or firstPrompt as default
+        // This ensures /status and /resume show the same session name
+        // Always add " (Branch)" suffix to make it clear this is a branched session
+        // Handle collisions by adding a number suffix (e.g., " (Branch 2)", " (Branch 3)")
+        const baseName = title ?? firstPrompt;
+        const effectiveTitle = await getUniqueForkName(baseName);
+        await (0, sessionStorage_js_1.saveCustomTitle)(sessionId, effectiveTitle, forkPath);
+        (0, index_js_1.logEvent)('tengu_conversation_forked', {
+            message_count: serializedMessages.length,
+            has_custom_title: !!title,
+        });
+        const forkLog = {
+            date: now.toISOString().split('T')[0],
+            messages: serializedMessages,
+            fullPath: forkPath,
+            value: now.getTime(),
+            created: now,
+            modified: now,
+            firstPrompt,
+            messageCount: serializedMessages.length,
+            isSidechain: false,
+            sessionId,
+            customTitle: effectiveTitle,
+            contentReplacements: contentReplacementRecords,
+        };
+        // Resume into the fork
+        const titleInfo = title ? ` "${title}"` : '';
+        const resumeHint = `\nTo resume the original: claude -r ${originalSessionId}`;
+        const successMessage = `Branched conversation${titleInfo}. You are now in the branch.${resumeHint}`;
+        if (context.resume) {
+            await context.resume(sessionId, forkLog, 'fork');
+            onDone(successMessage, { display: 'system' });
+        }
+        else {
+            // Fallback if resume not available
+            onDone(`Branched conversation${titleInfo}. Resume with: /resume ${sessionId}`);
+        }
+        return null;
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error occurred';
+        onDone(`Failed to branch conversation: ${message}`);
+        return null;
+    }
+}

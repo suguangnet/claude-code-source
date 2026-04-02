@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "jsx": "react",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "./dist",
+    "rootDir": "./project-source",
+    "strict": true
+  },
+  "include": [
+    "project-source/**/*"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

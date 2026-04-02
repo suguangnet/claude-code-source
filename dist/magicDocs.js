@@ -1,0 +1,199 @@
+"use strict";
+/**
+ * Magic Docs automatically maintains markdown documentation files marked with special headers.
+ * When a file with "# MAGIC DOC: [title]" is read, it runs periodically in the background
+ * using a forked subagent to update the document with new learnings from the conversation.
+ *
+ * See docs/magic-docs.md for more information.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.clearTrackedMagicDocs = clearTrackedMagicDocs;
+exports.detectMagicDocHeader = detectMagicDocHeader;
+exports.registerMagicDoc = registerMagicDoc;
+exports.initMagicDocs = initMagicDocs;
+const runAgent_js_1 = require("../../tools/AgentTool/runAgent.js");
+const constants_js_1 = require("../../tools/FileEditTool/constants.js");
+const FileReadTool_js_1 = require("../../tools/FileReadTool/FileReadTool.js");
+const errors_js_1 = require("../../utils/errors.js");
+const fileStateCache_js_1 = require("../../utils/fileStateCache.js");
+const postSamplingHooks_js_1 = require("../../utils/hooks/postSamplingHooks.js");
+const messages_js_1 = require("../../utils/messages.js");
+const sequential_js_1 = require("../../utils/sequential.js");
+const prompts_js_1 = require("./prompts.js");
+// Magic Doc header pattern: # MAGIC DOC: [title]
+// Matches at the start of the file (first line)
+const MAGIC_DOC_HEADER_PATTERN = /^#\s*MAGIC\s+DOC:\s*(.+)$/im;
+// Pattern to match italics on the line immediately after the header
+const ITALICS_PATTERN = /^[_*](.+?)[_*]\s*$/m;
+const trackedMagicDocs = new Map();
+function clearTrackedMagicDocs() {
+    trackedMagicDocs.clear();
+}
+/**
+ * Detect if a file content contains a Magic Doc header
+ * Returns an object with title and optional instructions, or null if not a magic doc
+ */
+function detectMagicDocHeader(content) {
+    const match = content.match(MAGIC_DOC_HEADER_PATTERN);
+    if (!match || !match[1]) {
+        return null;
+    }
+    const title = match[1].trim();
+    // Look for italics on the next line after the header (allow one optional blank line)
+    const headerEndIndex = match.index + match[0].length;
+    const afterHeader = content.slice(headerEndIndex);
+    // Match: newline, optional blank line, then content line
+    const nextLineMatch = afterHeader.match(/^\s*\n(?:\s*\n)?(.+?)(?:\n|$)/);
+    if (nextLineMatch && nextLineMatch[1]) {
+        const nextLine = nextLineMatch[1];
+        const italicsMatch = nextLine.match(ITALICS_PATTERN);
+        if (italicsMatch && italicsMatch[1]) {
+            const instructions = italicsMatch[1].trim();
+            return {
+                title,
+                instructions,
+            };
+        }
+    }
+    return { title };
+}
+/**
+ * Register a file as a Magic Doc when it's read
+ * Only registers once per file path - the hook always reads latest content
+ */
+function registerMagicDoc(filePath) {
+    // Only register if not already tracked
+    if (!trackedMagicDocs.has(filePath)) {
+        trackedMagicDocs.set(filePath, {
+            path: filePath,
+        });
+    }
+}
+/**
+ * Create Magic Docs agent definition
+ */
+function getMagicDocsAgent() {
+    return {
+        agentType: 'magic-docs',
+        whenToUse: 'Update Magic Docs',
+        tools: [constants_js_1.FILE_EDIT_TOOL_NAME], // Only allow Edit
+        model: 'sonnet',
+        source: 'built-in',
+        baseDir: 'built-in',
+        getSystemPrompt: () => '', // Will use override systemPrompt
+    };
+}
+/**
+ * Update a single Magic Doc
+ */
+async function updateMagicDoc(docInfo, context) {
+    const { messages, systemPrompt, userContext, systemContext, toolUseContext } = context;
+    // Clone the FileStateCache to isolate Magic Docs operations. Delete this
+    // doc's entry so FileReadTool's dedup doesn't return a file_unchanged
+    // stub — we need the actual content to re-detect the header.
+    const clonedReadFileState = (0, fileStateCache_js_1.cloneFileStateCache)(toolUseContext.readFileState);
+    clonedReadFileState.delete(docInfo.path);
+    const clonedToolUseContext = {
+        ...toolUseContext,
+        readFileState: clonedReadFileState,
+    };
+    // Read the document; if deleted or unreadable, remove from tracking
+    let currentDoc = '';
+    try {
+        const result = await FileReadTool_js_1.FileReadTool.call({ file_path: docInfo.path }, clonedToolUseContext);
+        const output = result.data;
+        if (output.type === 'text') {
+            currentDoc = output.file.content;
+        }
+    }
+    catch (e) {
+        // FileReadTool wraps ENOENT in a plain Error("File does not exist...") with
+        // no .code, so check the message in addition to isFsInaccessible (EACCES/EPERM).
+        if ((0, errors_js_1.isFsInaccessible)(e) ||
+            (e instanceof Error && e.message.startsWith('File does not exist'))) {
+            trackedMagicDocs.delete(docInfo.path);
+            return;
+        }
+        throw e;
+    }
+    // Re-detect title and instructions from latest file content
+    const detected = detectMagicDocHeader(currentDoc);
+    if (!detected) {
+        // File no longer has magic doc header, remove from tracking
+        trackedMagicDocs.delete(docInfo.path);
+        return;
+    }
+    // Build update prompt with latest title and instructions
+    const userPrompt = await (0, prompts_js_1.buildMagicDocsUpdatePrompt)(currentDoc, docInfo.path, detected.title, detected.instructions);
+    // Create a custom canUseTool that only allows Edit for magic doc files
+    const canUseTool = async (tool, input) => {
+        if (tool.name === constants_js_1.FILE_EDIT_TOOL_NAME &&
+            typeof input === 'object' &&
+            input !== null &&
+            'file_path' in input) {
+            const filePath = input.file_path;
+            if (typeof filePath === 'string' && filePath === docInfo.path) {
+                return { behavior: 'allow', updatedInput: input };
+            }
+        }
+        return {
+            behavior: 'deny',
+            message: `only ${constants_js_1.FILE_EDIT_TOOL_NAME} is allowed for ${docInfo.path}`,
+            decisionReason: {
+                type: 'other',
+                reason: `only ${constants_js_1.FILE_EDIT_TOOL_NAME} is allowed`,
+            },
+        };
+    };
+    // Run Magic Docs update using runAgent with forked context
+    for await (const _message of (0, runAgent_js_1.runAgent)({
+        agentDefinition: getMagicDocsAgent(),
+        promptMessages: [(0, messages_js_1.createUserMessage)({ content: userPrompt })],
+        toolUseContext: clonedToolUseContext,
+        canUseTool,
+        isAsync: true,
+        forkContextMessages: messages,
+        querySource: 'magic_docs',
+        override: {
+            systemPrompt,
+            userContext,
+            systemContext,
+        },
+        availableTools: clonedToolUseContext.options.tools,
+    })) {
+        // Just consume - let it run to completion
+    }
+}
+/**
+ * Magic Docs post-sampling hook that updates all tracked Magic Docs
+ */
+const updateMagicDocs = (0, sequential_js_1.sequential)(async function (context) {
+    const { messages, querySource } = context;
+    if (querySource !== 'repl_main_thread') {
+        return;
+    }
+    // Only update when conversation is idle (no tool calls in last turn)
+    const hasToolCalls = (0, messages_js_1.hasToolCallsInLastAssistantTurn)(messages);
+    if (hasToolCalls) {
+        return;
+    }
+    const docCount = trackedMagicDocs.size;
+    if (docCount === 0) {
+        return;
+    }
+    for (const docInfo of Array.from(trackedMagicDocs.values())) {
+        await updateMagicDoc(docInfo, context);
+    }
+});
+async function initMagicDocs() {
+    if (process.env.USER_TYPE === 'ant') {
+        // Register listener to detect magic docs when files are read
+        (0, FileReadTool_js_1.registerFileReadListener)((filePath, content) => {
+            const result = detectMagicDocHeader(content);
+            if (result) {
+                registerMagicDoc(filePath);
+            }
+        });
+        (0, postSamplingHooks_js_1.registerPostSamplingHook)(updateMagicDocs);
+    }
+}
